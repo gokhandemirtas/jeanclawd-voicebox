@@ -1,0 +1,25 @@
+[project]
+name = "jeanclawd-voicebox"
+version = "0.1.0"
+description = "FastAPI Whisper STT and expressive Chatterbox TTS server"
+readme = "README.md"
+authors = [
+    { name = "Gokhan Demirtas", email = "gokhan@ftuff.org" }
+]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "chatterbox-tts>=0.1.2",
+    "fastapi>=0.115.0",
+    "faster-whisper>=1.1.0",
+    "python-multipart>=0.0.9",
+    "setuptools<81",
+    "soundfile>=0.12.1",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+jeanclawd-voicebox = "jeanclawd_voicebox.server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
