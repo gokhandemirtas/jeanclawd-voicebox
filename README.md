@@ -6,7 +6,7 @@ Local FastAPI server with two endpoints:
 - `POST /synthesize` — JSON text plus Qwen speaker/emotion controls; returns a WAV stream.
 
 The default configuration is appropriate for a 24 GB NVIDIA GPU: Whisper
-`large-v3` in `float16` and Qwen3-TTS `0.6B-CustomVoice` share the GPU comfortably.
+`large-v3` in `float16` and Qwen3-TTS `1.7B-CustomVoice` share the GPU comfortably.
 Models download from Hugging Face on first request. The service falls back to
 CPU when CUDA is not available.
 
@@ -40,9 +40,23 @@ curl -F audio=@speech.m4a http://localhost:8000/transcribe
 
 curl -X POST http://localhost:8000/synthesize \
   -H 'content-type: application/json' \
-  -d '{"text":"Welcome back!", "emotion":"excited"}' \
+  -d '{"text":"Welcome back!", "emotion":"excited", "stream":false}' \
   --output welcome.wav
 ```
+
+Streaming is the default. The response is signed 16-bit little-endian PCM;
+the client can start playback as soon as the first sentence arrives:
+
+```bash
+curl -N -X POST http://localhost:8000/synthesize \
+  -H 'content-type: application/json' \
+  -d '{"text":"The first sentence starts quickly. The next sentence follows as another audio segment.","emotion":"calm"}' \
+  | ffplay -f s16le -ar 24000 -ac 1 -i - -nodisp -autoexit
+```
+
+Use `stream:false` when a complete WAV file is preferred. Qwen's current Python
+package does not expose incremental decoded audio tokens, so streaming is
+sentence/segment-level: the first segment plays before later segments finish.
 
 TTS emotions are natural-language instructions passed to Qwen. The default
 English speakers are `Ryan` and `Aiden`; use the `speaker` and `instruction`
@@ -54,7 +68,7 @@ fields to select a voice and further control delivery.
 VOICEBOX_DEVICE=auto                 # auto, cuda, or cpu
 VOICEBOX_WHISPER_MODEL=large-v3      # use distil-large-v3 for lower latency
 VOICEBOX_WHISPER_COMPUTE_TYPE=float16
-VOICEBOX_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+VOICEBOX_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 VOICEBOX_BEAM_SIZE=5
 VOICEBOX_PORT=8000
 ```

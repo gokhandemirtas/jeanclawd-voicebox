@@ -792,6 +792,8 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "faster-whisper" },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "python-multipart" },
     { name = "qwen-tts" },
     { name = "soundfile" },
@@ -802,8 +804,9 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "faster-whisper", specifier = ">=1.1.0" },
+    { name = "numpy", specifier = ">=1.26.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "qwen-tts", specifier = ">=0.0.5" },
+    { name = "qwen-tts", specifier = ">=0.1.1" },
     { name = "soundfile", specifier = ">=0.12.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
 ]

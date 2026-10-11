@@ -6,6 +6,7 @@ import io
 import argparse
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from threading import Lock, Thread
 from typing import Annotated
 
 import soundfile as sf
+import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -54,8 +56,9 @@ DEVICE = _device()
 WHISPER_MODEL = os.getenv("VOICEBOX_WHISPER_MODEL", "large-v3")
 TTS_MODEL = os.getenv(
     "VOICEBOX_TTS_MODEL",
-    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 )
+QWEN_SAMPLE_RATE = 24_000
 _whisper = None
 _tts = None
 _model_lock = Lock()
@@ -115,6 +118,7 @@ class SynthesisRequest(BaseModel):
     speaker: str = Field(default="Ryan", min_length=1, max_length=64)
     instruction: str | None = Field(default=None, max_length=500)
     language: str = Field(default="English", min_length=2, max_length=32)
+    stream: bool = Field(default=True, description="Stream signed 16-bit PCM segments")
 
     @field_validator("text")
     @classmethod
@@ -152,6 +156,46 @@ def _qwen_language(language: str) -> str:
         "it": "Italian",
     }
     return names.get(language.lower(), language)
+
+
+def _split_text_for_streaming(text: str, max_chars: int = 240) -> list[str]:
+    """Make playable segments without splitting ordinary sentences."""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+", text) if part.strip()]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences or [text]:
+        if current and len(current) + len(sentence) + 1 > max_chars:
+            chunks.append(current)
+            current = ""
+        if len(sentence) <= max_chars:
+            current = f"{current} {sentence}".strip()
+            continue
+        words = sentence.split()
+        for word in words:
+            if current and len(current) + len(word) + 1 > max_chars:
+                chunks.append(current)
+                current = ""
+            current = f"{current} {word}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _pcm16(audio: np.ndarray) -> bytes:
+    samples = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
+    return (samples * 32767.0).astype("<i2").tobytes()
+
+
+def _wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
+    output = io.BytesIO()
+    sf.write(
+        output,
+        np.frombuffer(pcm, dtype="<i2"),
+        sample_rate,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return output.getvalue()
 
 
 def _autoplay_debug_audio(audio: bytes) -> None:
@@ -264,7 +308,7 @@ async def transcribe(
 
 @app.post("/synthesize", response_class=StreamingResponse)
 async def synthesize(request: SynthesisRequest):
-    """Generate a WAV file with Qwen's natural-language style control."""
+    """Generate audio as streamed PCM, or a complete WAV when stream=false."""
     request_id = uuid.uuid4().hex[:12]
     started = time.perf_counter()
     logger.info(
@@ -276,33 +320,13 @@ async def synthesize(request: SynthesisRequest):
     instruction = _emotion_instruction(request.emotion)
     if request.instruction:
         instruction = f"{instruction} {request.instruction}"
-    try:
-        with _inference_lock:
-            model = _get_tts()
-            with torch.inference_mode():
-                wavs, sample_rate = model.generate_custom_voice(
-                    text=request.text,
-                    language=_qwen_language(request.language),
-                    speaker=request.speaker,
-                    instruct=instruction,
-                )
 
-        audio = wavs[0]
-        if isinstance(audio, torch.Tensor):
-            audio = audio.detach().cpu().numpy()
-        output = io.BytesIO()
-        sf.write(output, audio, int(sample_rate), format="WAV", subtype="PCM_16")
-        output.seek(0)
-        _autoplay_debug_audio(output.getvalue())
-        logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
-        return StreamingResponse(
-            output,
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": "inline; filename=voicebox.wav",
-                "X-Request-ID": request_id,
-            },
-        )
+    try:
+        # Load before returning StreamingResponse so download/model errors still
+        # produce a useful HTTP 500 rather than a broken audio stream.
+        from starlette.concurrency import run_in_threadpool
+
+        model = await run_in_threadpool(_get_tts)
     except Exception as exc:
         logger.exception("[%s] synthesis failed", request_id)
         raise HTTPException(
@@ -310,6 +334,81 @@ async def synthesize(request: SynthesisRequest):
             detail=f"Synthesis failed; request_id={request_id}. See the server log.",
             headers={"X-Request-ID": request_id},
         ) from exc
+
+    if not request.stream:
+        try:
+            with _inference_lock, torch.inference_mode():
+                wavs, sample_rate = model.generate_custom_voice(
+                    text=request.text,
+                    language=_qwen_language(request.language),
+                    speaker=request.speaker,
+                    instruct=instruction,
+                    non_streaming_mode=True,
+                )
+            audio = wavs[0]
+            if isinstance(audio, torch.Tensor):
+                audio = audio.detach().cpu().numpy()
+            wav = _wav_bytes(_pcm16(audio), int(sample_rate))
+            _autoplay_debug_audio(wav)
+            logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
+            return StreamingResponse(
+                io.BytesIO(wav),
+                media_type="audio/wav",
+                headers={
+                    "Content-Disposition": "inline; filename=voicebox.wav",
+                    "X-Request-ID": request_id,
+                },
+            )
+        except Exception as exc:
+            logger.exception("[%s] synthesis failed", request_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Synthesis failed; request_id={request_id}. See the server log.",
+                headers={"X-Request-ID": request_id},
+            ) from exc
+
+    def pcm_stream():
+        pcm_parts: list[bytes] = []
+        sample_rate = QWEN_SAMPLE_RATE
+        try:
+            with _inference_lock:
+                for index, text_chunk in enumerate(_split_text_for_streaming(request.text)):
+                    with torch.inference_mode():
+                        wavs, sample_rate = model.generate_custom_voice(
+                            text=text_chunk,
+                            language=_qwen_language(request.language),
+                            speaker=request.speaker,
+                            instruct=instruction,
+                            # This selects Qwen's lower-latency text path. The
+                            # package still returns one waveform per segment.
+                            non_streaming_mode=False,
+                        )
+                    pcm = _pcm16(wavs[0])
+                    pcm_parts.append(pcm)
+                    logger.info(
+                        "[%s] streamed segment=%d characters=%d",
+                        request_id,
+                        index + 1,
+                        len(text_chunk),
+                    )
+                    yield pcm
+            if _debug_play_audio:
+                _autoplay_debug_audio(_wav_bytes(b"".join(pcm_parts), int(sample_rate)))
+            logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
+        except Exception:
+            logger.exception("[%s] synthesis stream failed", request_id)
+
+    return StreamingResponse(
+        pcm_stream(),
+        media_type=f"audio/L16;rate={QWEN_SAMPLE_RATE};channels=1",
+        headers={
+            "X-Request-ID": request_id,
+            "X-Audio-Sample-Rate": str(QWEN_SAMPLE_RATE),
+            "X-Audio-Format": "s16le",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def main() -> None:
