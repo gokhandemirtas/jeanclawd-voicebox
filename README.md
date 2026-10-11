@@ -59,12 +59,28 @@ the client can start playback as soon as the first sentence arrives:
 curl -N -X POST http://localhost:8000/synthesize \
   -H 'content-type: application/json' \
   -d '{"text":"The first sentence starts quickly. The next sentence follows as another audio segment.","emotion":"calm"}' \
-  | ffplay -f s16le -ar 24000 -ac 1 -i - -nodisp -autoexit
+  | ffplay -f s16le -ar 24000 -i - -nodisp -autoexit
 ```
 
 Use `stream:false` when a complete WAV file is preferred. Qwen's current Python
 package does not expose incremental decoded audio tokens, so streaming is
 sentence/segment-level: the first segment plays before later segments finish.
+
+For per-sentence emotional control, send ordered `segments` instead of `text`:
+
+```json
+{
+  "segments": [
+    {"text": "I have wonderful news!", "emotion": "excited"},
+    {"text": "Please take a deep breath.", "emotion": "calm"},
+    {"text": "We need to fix this immediately.", "emotion": "angry", "instruction": "Speak urgently and firmly."}
+  ]
+}
+```
+
+The `emotion` field accepts the six built-in values (`neutral`, `happy`, `sad`,
+`angry`, `excited`, and `calm`). Add an `instruction` to a segment for a more
+specific delivery.
 
 TTS emotions are natural-language instructions passed to Qwen. The default
 English speakers are `Ryan` and `Aiden`; use the `speaker` and `instruction`

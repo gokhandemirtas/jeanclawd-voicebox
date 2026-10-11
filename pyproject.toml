@@ -10,10 +10,12 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
     "fastapi>=0.115.0",
     "faster-whisper>=1.1.0",
+    "flash-attn>=2.8.3",
     "numpy>=1.26.0",
     "python-multipart>=0.0.9",
     "qwen-tts>=0.1.1",
     "soundfile>=0.12.1",
+    "torch>=2.6.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -23,3 +25,9 @@ jeanclawd-voicebox = "jeanclawd_voicebox.server:main"
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.extra-build-dependencies]
+# flash-attn imports torch from setup.py, but does not declare it as a
+# build-system requirement. Make the project torch available in its isolated
+# build environment.
+flash-attn = ["torch==2.6.0", "numpy"]

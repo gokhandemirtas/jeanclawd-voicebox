@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger("jeanclawd_voicebox")
 
@@ -38,8 +38,12 @@ def _configure_logging() -> None:
         file_handler = logging.FileHandler(log_path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+    if not any(type(handler) is logging.StreamHandler for handler in logger.handlers):
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(console_handler)
     logger.setLevel(logging.INFO)
-    logger.propagate = True
+    logger.propagate = False
 
 
 _configure_logging()
@@ -114,13 +118,34 @@ class Emotion(str, Enum):
     calm = "calm"
 
 
-class SynthesisRequest(BaseModel):
+class SynthesisSegment(BaseModel):
+    """One independently styled piece of a synthesis request."""
+
     text: str = Field(min_length=1, max_length=10_000)
+    emotion: Emotion = Emotion.neutral
+    instruction: str | None = Field(default=None, max_length=500)
+
+    @field_validator("text")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        normalized = " ".join(
+            line.strip()
+            for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if line.strip()
+        )
+        if not normalized:
+            raise ValueError("segment text must contain at least one non-whitespace character")
+        return normalized
+
+
+class SynthesisRequest(BaseModel):
+    text: str | None = Field(default=None, max_length=10_000)
     emotion: Emotion = Emotion.neutral
     speaker: str = Field(default="Ryan", min_length=1, max_length=64)
     instruction: str | None = Field(default=None, max_length=500)
     language: str = Field(default="English", min_length=2, max_length=32)
     stream: bool = Field(default=True, description="Stream signed 16-bit PCM segments")
+    segments: list[SynthesisSegment] | None = Field(default=None, max_length=100)
 
     @field_validator("text")
     @classmethod
@@ -131,6 +156,14 @@ class SynthesisRequest(BaseModel):
         if not normalized:
             raise ValueError("text must contain at least one non-whitespace character")
         return normalized
+
+    @model_validator(mode="after")
+    def require_text_or_segments(self):
+        if self.text is None and not self.segments:
+            raise ValueError("provide text or at least one synthesis segment")
+        if self.text is not None and self.segments:
+            raise ValueError("use either text or segments, not both")
+        return self
 
 
 def _emotion_instruction(emotion: Emotion) -> str:
@@ -183,6 +216,21 @@ def _split_text_for_streaming(text: str, max_chars: int = 240) -> list[str]:
     return chunks
 
 
+def _synthesis_segments(request: SynthesisRequest) -> list[SynthesisSegment]:
+    if request.segments is not None:
+        return request.segments
+    return [SynthesisSegment(text=request.text or "", emotion=request.emotion, instruction=request.instruction)]
+
+
+def _segment_instruction(segment: SynthesisSegment, request: SynthesisRequest) -> str:
+    instruction = _emotion_instruction(segment.emotion)
+    if segment.instruction:
+        instruction = f"{instruction} {segment.instruction}"
+    if request.instruction and request.segments:
+        instruction = f"{instruction} {request.instruction}"
+    return instruction
+
+
 def _pcm16(audio: np.ndarray) -> bytes:
     samples = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
     return (samples * 32767.0).astype("<i2").tobytes()
@@ -215,7 +263,7 @@ def _autoplay_debug_audio(audio: bytes) -> None:
         audio_path = audio_file.name
 
     if os.path.basename(player) == "ffplay":
-        command = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path]
+        command = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", "100", audio_path]
     elif os.path.basename(player) == "mpv":
         command = [player, "--no-video", "--really-quiet", audio_path]
     else:
@@ -242,6 +290,38 @@ def _autoplay_debug_audio(audio: bytes) -> None:
 
     Thread(target=play_and_cleanup, daemon=True).start()
     logger.info("debug playback started with %s", os.path.basename(player))
+
+
+def _start_debug_pcm_playback() -> subprocess.Popen[bytes] | None:
+    """Start ffplay for raw PCM so debug streaming can play each segment immediately."""
+    player = shutil.which("ffplay")
+    if player is None:
+        logger.warning("streaming debug playback requires ffplay, but it was not found")
+        return None
+
+    command = [
+        player,
+        "-f",
+        "s16le",
+        "-ar",
+        str(QWEN_SAMPLE_RATE),
+        "-i",
+        "-",
+        "-nodisp",
+        "-autoexit",
+        "-loglevel",
+        "quiet",
+        "-volume",
+        "100",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    logger.info("streaming debug playback started with ffplay")
+    return process
 
 
 @asynccontextmanager
@@ -279,7 +359,11 @@ async def transcribe(
 
     request_id = uuid.uuid4().hex[:12]
     started = time.perf_counter()
-    logger.info("[%s] started transcription: %s", request_id, audio.filename or "audio")
+    logger.info(
+        "[%s] request received, processing transcription: %s",
+        request_id,
+        audio.filename or "audio",
+    )
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as source:
             source.write(data)
@@ -318,15 +402,14 @@ async def synthesize(request: SynthesisRequest):
     """Generate audio as streamed PCM, or a complete WAV when stream=false."""
     request_id = uuid.uuid4().hex[:12]
     started = time.perf_counter()
+    segments = _synthesis_segments(request)
+    character_count = sum(len(segment.text) for segment in segments)
     logger.info(
-        "[%s] started synthesis: emotion=%s characters=%d",
+        "[%s] request received, processing synthesis: emotion=%s characters=%d",
         request_id,
-        request.emotion.value,
-        len(request.text),
+        ",".join(segment.emotion.value for segment in segments),
+        character_count,
     )
-    instruction = _emotion_instruction(request.emotion)
-    if request.instruction:
-        instruction = f"{instruction} {request.instruction}"
 
     try:
         # Load before returning StreamingResponse so download/model errors still
@@ -344,18 +427,22 @@ async def synthesize(request: SynthesisRequest):
 
     if not request.stream:
         try:
+            pcm_parts: list[bytes] = []
+            sample_rate = QWEN_SAMPLE_RATE
             with _inference_lock, torch.inference_mode():
-                wavs, sample_rate = model.generate_custom_voice(
-                    text=request.text,
-                    language=_qwen_language(request.language),
-                    speaker=request.speaker,
-                    instruct=instruction,
-                    non_streaming_mode=True,
-                )
-            audio = wavs[0]
-            if isinstance(audio, torch.Tensor):
-                audio = audio.detach().cpu().numpy()
-            wav = _wav_bytes(_pcm16(audio), int(sample_rate))
+                for segment in segments:
+                    wavs, sample_rate = model.generate_custom_voice(
+                        text=segment.text,
+                        language=_qwen_language(request.language),
+                        speaker=request.speaker,
+                        instruct=_segment_instruction(segment, request),
+                        non_streaming_mode=True,
+                    )
+                    audio = wavs[0]
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.detach().cpu().numpy()
+                    pcm_parts.append(_pcm16(audio))
+            wav = _wav_bytes(b"".join(pcm_parts), int(sample_rate))
             _autoplay_debug_audio(wav)
             logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
             return StreamingResponse(
@@ -375,35 +462,54 @@ async def synthesize(request: SynthesisRequest):
             ) from exc
 
     def pcm_stream():
-        pcm_parts: list[bytes] = []
         sample_rate = QWEN_SAMPLE_RATE
+        debug_player = None
         try:
             with _inference_lock:
-                for index, text_chunk in enumerate(_split_text_for_streaming(request.text)):
-                    with torch.inference_mode():
-                        wavs, sample_rate = model.generate_custom_voice(
-                            text=text_chunk,
-                            language=_qwen_language(request.language),
-                            speaker=request.speaker,
-                            instruct=instruction,
-                            # This selects Qwen's lower-latency text path. The
-                            # package still returns one waveform per segment.
-                            non_streaming_mode=False,
+                stream_index = 0
+                for segment in segments:
+                    instruction = _segment_instruction(segment, request)
+                    for text_chunk in _split_text_for_streaming(segment.text):
+                        with torch.inference_mode():
+                            wavs, sample_rate = model.generate_custom_voice(
+                                text=text_chunk,
+                                language=_qwen_language(request.language),
+                                speaker=request.speaker,
+                                instruct=instruction,
+                                # This selects Qwen's lower-latency text path. The
+                                # package still returns one waveform per segment.
+                                non_streaming_mode=False,
+                            )
+                        pcm = _pcm16(wavs[0])
+                        stream_index += 1
+                        logger.info(
+                            "[%s] streamed segment=%d emotion=%s characters=%d",
+                            request_id,
+                            stream_index,
+                            segment.emotion.value,
+                            len(text_chunk),
                         )
-                    pcm = _pcm16(wavs[0])
-                    pcm_parts.append(pcm)
-                    logger.info(
-                        "[%s] streamed segment=%d characters=%d",
-                        request_id,
-                        index + 1,
-                        len(text_chunk),
-                    )
-                    yield pcm
-            if _debug_play_audio:
-                _autoplay_debug_audio(_wav_bytes(b"".join(pcm_parts), int(sample_rate)))
+                        if _debug_play_audio and debug_player is None:
+                            debug_player = _start_debug_pcm_playback()
+                        if debug_player is not None and debug_player.stdin is not None:
+                            try:
+                                debug_player.stdin.write(pcm)
+                                debug_player.stdin.flush()
+                            except BrokenPipeError:
+                                logger.warning("streaming debug playback stopped before segment=%d", stream_index)
+                                debug_player.stdin.close()
+                                debug_player.wait()
+                                debug_player = None
+                        yield pcm
             logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
         except Exception:
             logger.exception("[%s] synthesis stream failed", request_id)
+        finally:
+            if debug_player is not None:
+                if debug_player.stdin is not None:
+                    debug_player.stdin.close()
+                debug_player.wait()
+                logger.info("streaming debug playback finished: player=ffplay")
 
     return StreamingResponse(
         pcm_stream(),
