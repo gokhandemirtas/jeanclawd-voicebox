@@ -7,8 +7,8 @@ Local FastAPI server with two endpoints:
 
 The default configuration is appropriate for a 24 GB NVIDIA GPU: Whisper
 `large-v3` in `float16` and Qwen3-TTS `1.7B-CustomVoice` share the GPU comfortably.
-Models download from Hugging Face on first request. The service falls back to
-CPU when CUDA is not available.
+Models download from Hugging Face on first request. CUDA is mandatory; the
+server refuses to start if PyTorch cannot access an NVIDIA GPU.
 
 ## Run
 
@@ -16,6 +16,14 @@ CPU when CUDA is not available.
 uv sync
 uv run jeanclawd-voicebox
 ```
+
+Verify CUDA first:
+
+```bash
+.venv/bin/python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'
+```
+
+The server always loads Whisper and Qwen on `cuda:0`; there is no CPU fallback.
 
 For temporary local autoplay of generated speech, run:
 
@@ -65,7 +73,6 @@ fields to select a voice and further control delivery.
 ## Configuration
 
 ```bash
-VOICEBOX_DEVICE=auto                 # auto, cuda, or cpu
 VOICEBOX_WHISPER_MODEL=large-v3      # use distil-large-v3 for lower latency
 VOICEBOX_WHISPER_COMPUTE_TYPE=float16
 VOICEBOX_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice

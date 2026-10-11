@@ -46,10 +46,12 @@ _configure_logging()
 
 
 def _device() -> str:
-    requested = os.getenv("VOICEBOX_DEVICE", "auto").lower()
-    if requested in {"cuda", "cpu"}:
-        return requested
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is mandatory for JeanClawd Voicebox, but PyTorch cannot access an NVIDIA GPU. "
+            "Check the NVIDIA driver, CUDA-enabled PyTorch installation, and CUDA_VISIBLE_DEVICES."
+        )
+    return "cuda"
 
 
 DEVICE = _device()
@@ -93,8 +95,8 @@ def _get_tts():
             if _tts is None:
                 from qwen_tts import Qwen3TTSModel
 
-                dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-                device_map = "cuda:0" if DEVICE == "cuda" else "cpu"
+                dtype = torch.bfloat16
+                device_map = "cuda:0"
                 _tts = Qwen3TTSModel.from_pretrained(
                     TTS_MODEL,
                     device_map=device_map,
@@ -244,6 +246,11 @@ def _autoplay_debug_audio(audio: bytes) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is mandatory for JeanClawd Voicebox, but no usable NVIDIA GPU was detected."
+        )
+    logger.info("CUDA ready: %s", torch.cuda.get_device_name(0))
     yield
     global _whisper, _tts
     _whisper = None
