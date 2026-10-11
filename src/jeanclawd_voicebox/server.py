@@ -52,7 +52,10 @@ def _device() -> str:
 
 DEVICE = _device()
 WHISPER_MODEL = os.getenv("VOICEBOX_WHISPER_MODEL", "large-v3")
-TTS_MODEL = os.getenv("VOICEBOX_TTS_MODEL", "standard").lower()
+TTS_MODEL = os.getenv(
+    "VOICEBOX_TTS_MODEL",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+)
 _whisper = None
 _tts = None
 _model_lock = Lock()
@@ -85,14 +88,15 @@ def _get_tts():
     if _tts is None:
         with _model_lock:
             if _tts is None:
-                if TTS_MODEL == "multilingual":
-                    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+                from qwen_tts import Qwen3TTSModel
 
-                    _tts = ChatterboxMultilingualTTS.from_pretrained(device=DEVICE)
-                else:
-                    from chatterbox.tts import ChatterboxTTS
-
-                    _tts = ChatterboxTTS.from_pretrained(device=DEVICE)
+                dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+                device_map = "cuda:0" if DEVICE == "cuda" else "cpu"
+                _tts = Qwen3TTSModel.from_pretrained(
+                    TTS_MODEL,
+                    device_map=device_map,
+                    dtype=dtype,
+                )
     return _tts
 
 
@@ -108,33 +112,46 @@ class Emotion(str, Enum):
 class SynthesisRequest(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
     emotion: Emotion = Emotion.neutral
-    exaggeration: float | None = Field(default=None, ge=0.0, le=1.0)
-    cfg_weight: float | None = Field(default=None, ge=0.0, le=1.0)
-    temperature: float = Field(default=0.8, ge=0.05, le=2.0)
-    voice_wav: str | None = Field(default=None, description="Local path to a reference WAV")
-    language: str = Field(default="en", min_length=2, max_length=8)
+    speaker: str = Field(default="Ryan", min_length=1, max_length=64)
+    instruction: str | None = Field(default=None, max_length=500)
+    language: str = Field(default="English", min_length=2, max_length=32)
 
     @field_validator("text")
     @classmethod
     def normalize_text(cls, value: str) -> str:
-        # JSON clients may submit escaped newlines or CRLF text. Chatterbox
-        # performs its own punctuation normalization, so give it a stable
-        # single-line input while retaining the words and punctuation.
+        # Normalize line endings so multiline JSON/client requests are stable
+        # across TTS backends while retaining words and punctuation.
         normalized = " ".join(line.strip() for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip())
         if not normalized:
             raise ValueError("text must contain at least one non-whitespace character")
         return normalized
 
 
-def _emotion_controls(emotion: Emotion) -> tuple[float, float]:
+def _emotion_instruction(emotion: Emotion) -> str:
     return {
-        Emotion.neutral: (0.50, 0.50),
-        Emotion.happy: (0.78, 0.42),
-        Emotion.sad: (0.62, 0.32),
-        Emotion.angry: (0.92, 0.38),
-        Emotion.excited: (0.95, 0.48),
-        Emotion.calm: (0.35, 0.58),
+        Emotion.neutral: "Speak naturally and clearly.",
+        Emotion.happy: "Speak in a warm, happy, upbeat tone.",
+        Emotion.sad: "Speak gently with a sincere, sad, reflective tone.",
+        Emotion.angry: "Speak with controlled anger and firm intensity.",
+        Emotion.excited: "Speak with energetic excitement and bright enthusiasm.",
+        Emotion.calm: "Speak calmly, warmly, and meditatively.",
     }[emotion]
+
+
+def _qwen_language(language: str) -> str:
+    names = {
+        "en": "English",
+        "zh": "Chinese",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "de": "German",
+        "fr": "French",
+        "ru": "Russian",
+        "pt": "Portuguese",
+        "es": "Spanish",
+        "it": "Italian",
+    }
+    return names.get(language.lower(), language)
 
 
 def _autoplay_debug_audio(audio: bytes) -> None:
@@ -194,7 +211,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="JeanClawd Voicebox",
     version="0.1.0",
-    description="Local Whisper STT and expressive Chatterbox TTS",
+    description="Local Whisper STT and expressive Qwen3-TTS",
     lifespan=lifespan,
 )
 
@@ -247,7 +264,7 @@ async def transcribe(
 
 @app.post("/synthesize", response_class=StreamingResponse)
 async def synthesize(request: SynthesisRequest):
-    """Generate a WAV file; emotion maps to Chatterbox expression controls."""
+    """Generate a WAV file with Qwen's natural-language style control."""
     request_id = uuid.uuid4().hex[:12]
     started = time.perf_counter()
     logger.info(
@@ -256,30 +273,25 @@ async def synthesize(request: SynthesisRequest):
         request.emotion.value,
         len(request.text),
     )
-    exaggeration, cfg_weight = _emotion_controls(request.emotion)
-    if request.exaggeration is not None:
-        exaggeration = request.exaggeration
-    if request.cfg_weight is not None:
-        cfg_weight = request.cfg_weight
-
+    instruction = _emotion_instruction(request.emotion)
+    if request.instruction:
+        instruction = f"{instruction} {request.instruction}"
     try:
         with _inference_lock:
             model = _get_tts()
-            kwargs = {
-                "exaggeration": exaggeration,
-                "cfg_weight": cfg_weight,
-                "temperature": request.temperature,
-            }
-            if request.voice_wav:
-                kwargs["audio_prompt_path"] = request.voice_wav
-            if TTS_MODEL == "multilingual":
-                kwargs["language_id"] = request.language
             with torch.inference_mode():
-                wav = model.generate(request.text, **kwargs)
+                wavs, sample_rate = model.generate_custom_voice(
+                    text=request.text,
+                    language=_qwen_language(request.language),
+                    speaker=request.speaker,
+                    instruct=instruction,
+                )
 
-        audio = wav.detach().cpu().squeeze().numpy()
+        audio = wavs[0]
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
         output = io.BytesIO()
-        sf.write(output, audio, int(model.sr), format="WAV", subtype="PCM_16")
+        sf.write(output, audio, int(sample_rate), format="WAV", subtype="PCM_16")
         output.seek(0)
         _autoplay_debug_audio(output.getvalue())
         logger.info("[%s] started -> generated in %.1f seconds", request_id, time.perf_counter() - started)
