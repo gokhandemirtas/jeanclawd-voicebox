@@ -3,12 +3,12 @@
 Local FastAPI server with two endpoints:
 
 - `POST /transcribe` — multipart field `audio`; Whisper `large-v3` transcription.
-- `POST /synthesize` — JSON text plus Qwen speaker/emotion controls; returns a WAV stream.
+- `POST /synthesize` — JSON text plus model-independent speaker/emotion controls; returns a WAV stream.
 
-The default configuration is appropriate for a 24 GB NVIDIA GPU: Whisper
-`large-v3` in `float16` and Qwen3-TTS `1.7B-CustomVoice` share the GPU comfortably.
-Models download from Hugging Face on first request. CUDA is mandatory; the
-server refuses to start if PyTorch cannot access an NVIDIA GPU.
+When CUDA is available, the service prefers Qwen3-TTS `1.7B-CustomVoice`.
+Without a usable CUDA device, or if Qwen fails to load, it falls back to
+Supertonic-3, which runs through ONNX Runtime on CPU. Models download on first
+use.
 
 ## Run
 
@@ -23,7 +23,9 @@ Verify CUDA first:
 .venv/bin/python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'
 ```
 
-The server always loads Whisper and Qwen on `cuda:0`; there is no CPU fallback.
+Whisper uses CUDA when available and otherwise falls back to CPU settings.
+Supertonic provides the CPU TTS fallback with ten built-in voices (`M1`–`M5`
+and `F1`–`F5`). Set `VOICEBOX_SUPERTONIC_VOICE` to choose its default voice.
 
 For temporary local autoplay of generated speech, run:
 
@@ -82,9 +84,12 @@ The `emotion` field accepts the six built-in values (`neutral`, `happy`, `sad`,
 `angry`, `excited`, and `calm`). Add an `instruction` to a segment for a more
 specific delivery.
 
-TTS emotions are natural-language instructions passed to Qwen. The default
-English speakers are `Ryan` and `Aiden`; use the `speaker` and `instruction`
-fields to select a voice and further control delivery.
+TTS emotions are translated per backend. Qwen receives natural-language
+instructions; Supertonic uses its expression tags and speed control. The
+default Qwen English speakers are `Ryan` and `Aiden`. When Supertonic is active,
+use an `M1`–`M5` or `F1`–`F5` speaker value, or configure
+`VOICEBOX_SUPERTONIC_VOICE`. The `instruction` field is applied by Qwen and is
+ignored by Supertonic because it has no free-form instruction parameter.
 
 ## Configuration
 
@@ -92,6 +97,7 @@ fields to select a voice and further control delivery.
 VOICEBOX_WHISPER_MODEL=large-v3      # use distil-large-v3 for lower latency
 VOICEBOX_WHISPER_COMPUTE_TYPE=float16
 VOICEBOX_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+VOICEBOX_SUPERTONIC_VOICE=M1
 VOICEBOX_BEAM_SIZE=5
 VOICEBOX_PORT=8000
 ```

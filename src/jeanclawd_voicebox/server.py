@@ -13,10 +13,11 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Annotated
+from typing import Annotated, Any
 
 import soundfile as sf
 import numpy as np
@@ -50,12 +51,8 @@ _configure_logging()
 
 
 def _device() -> str:
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is mandatory for JeanClawd Voicebox, but PyTorch cannot access an NVIDIA GPU. "
-            "Check the NVIDIA driver, CUDA-enabled PyTorch installation, and CUDA_VISIBLE_DEVICES."
-        )
-    return "cuda"
+    """Choose the preferred device without making CUDA a startup requirement."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 DEVICE = _device()
@@ -65,11 +62,22 @@ TTS_MODEL = os.getenv(
     "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 )
 QWEN_SAMPLE_RATE = 24_000
+SUPERTONIC_VOICE = os.getenv("VOICEBOX_SUPERTONIC_VOICE", "M1")
 _whisper = None
 _tts = None
+_tts_backend = None
 _model_lock = Lock()
 _inference_lock = Lock()
 _debug_play_audio = False
+
+
+class Emotion(str, Enum):
+    neutral = "neutral"
+    happy = "happy"
+    sad = "sad"
+    angry = "angry"
+    excited = "excited"
+    calm = "calm"
 
 
 def _get_whisper():
@@ -92,30 +100,96 @@ def _get_whisper():
     return _whisper
 
 
-def _get_tts():
-    global _tts
+class TTSBackend(str, Enum):
+    qwen = "qwen"
+    supertonic = "supertonic"
+
+
+@dataclass(frozen=True)
+class TTSRuntime:
+    backend: TTSBackend
+    model: Any
+    sample_rate: int
+
+
+# These are the model-facing emotion names. The reverse maps are built below
+# so integrations can translate either direction without hard-coding a model.
+# Supertonic has expression tags and speed control rather than Qwen's
+# natural-language instruction parameter. These labels describe the closest
+# available expression profile used by the adapter.
+MODEL_EMOTION_MAP: dict[TTSBackend, dict[Emotion, str]] = {
+    TTSBackend.qwen: {
+        Emotion.neutral: "neutral",
+        Emotion.happy: "happy",
+        Emotion.sad: "sad",
+        Emotion.angry: "angry",
+        Emotion.excited: "excited",
+        Emotion.calm: "calm",
+    },
+    TTSBackend.supertonic: {
+        Emotion.neutral: "neutral",
+        Emotion.happy: "laugh",
+        Emotion.sad: "sigh",
+        Emotion.angry: "intense",
+        Emotion.excited: "laugh",
+        Emotion.calm: "gentle",
+    },
+}
+REVERSE_MODEL_EMOTION_MAP: dict[TTSBackend, dict[str, Emotion]] = {
+    backend: {model_emotion: emotion for emotion, model_emotion in mapping.items()}
+    for backend, mapping in MODEL_EMOTION_MAP.items()
+}
+
+# Supertonic supports inline expression tags and speed control. The tags are
+# intentionally conservative because unsupported tags can become audible text.
+SUPERTONIC_EMOTION_CONTROLS: dict[Emotion, tuple[str, float]] = {
+    Emotion.neutral: ("", 1.05),
+    Emotion.happy: ("<laugh>", 1.10),
+    Emotion.sad: ("<sigh>", 0.90),
+    Emotion.angry: ("", 1.15),
+    Emotion.excited: ("<laugh>", 1.20),
+    Emotion.calm: ("<sigh>", 0.85),
+}
+
+
+def _get_tts() -> TTSRuntime:
+    global _tts, _tts_backend
     if _tts is None:
         with _model_lock:
             if _tts is None:
-                from qwen_tts import Qwen3TTSModel
+                if DEVICE == "cuda":
+                    try:
+                        from qwen_tts import Qwen3TTSModel
 
-                dtype = torch.bfloat16
-                device_map = "cuda:0"
-                _tts = Qwen3TTSModel.from_pretrained(
-                    TTS_MODEL,
-                    device_map=device_map,
-                    dtype=dtype,
-                )
-    return _tts
+                        _tts = Qwen3TTSModel.from_pretrained(
+                            TTS_MODEL,
+                            device_map="cuda:0",
+                            dtype=torch.bfloat16,
+                        )
+                        _tts_backend = TTSRuntime(TTSBackend.qwen, _tts, QWEN_SAMPLE_RATE)
+                        logger.info("TTS backend selected: qwen device=cuda")
+                    except Exception:
+                        logger.exception("Qwen could not be loaded; falling back to Chatterbox")
 
+                if _tts_backend is None:
+                    try:
+                        from supertonic import TTS
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "Supertonic is required because Qwen is unavailable, but it is not installed. "
+                            "Install the supertonic package in the runtime environment used by Voicebox."
+                        ) from exc
 
-class Emotion(str, Enum):
-    neutral = "neutral"
-    happy = "happy"
-    sad = "sad"
-    angry = "angry"
-    excited = "excited"
-    calm = "calm"
+                    _tts = TTS(auto_download=True)
+                    _tts_backend = TTSRuntime(
+                        TTSBackend.supertonic,
+                        _tts,
+                        44_100,
+                    )
+                    logger.info("TTS backend selected: supertonic")
+    if _tts_backend is None:
+        raise RuntimeError("No TTS backend is available")
+    return _tts_backend
 
 
 class SynthesisSegment(BaseModel):
@@ -177,6 +251,19 @@ def _emotion_instruction(emotion: Emotion) -> str:
     }[emotion]
 
 
+def _model_emotion(backend: TTSBackend, emotion: Emotion) -> str:
+    """Return the valid model-facing emotion label for a canonical emotion."""
+    return MODEL_EMOTION_MAP[backend][emotion]
+
+
+def _canonical_emotion(backend: TTSBackend, model_emotion: str) -> Emotion:
+    """Translate a model-facing emotion label back to the public emotion enum."""
+    try:
+        return REVERSE_MODEL_EMOTION_MAP[backend][model_emotion]
+    except KeyError as exc:
+        raise ValueError(f"unknown {backend.value} emotion: {model_emotion}") from exc
+
+
 def _qwen_language(language: str) -> str:
     names = {
         "en": "English",
@@ -191,6 +278,22 @@ def _qwen_language(language: str) -> str:
         "it": "Italian",
     }
     return names.get(language.lower(), language)
+
+
+def _supertonic_language(language: str) -> str:
+    """Convert the public language field to Supertonic's ISO language code."""
+    return {
+        "english": "en",
+        "chinese": "zh",
+        "japanese": "ja",
+        "korean": "ko",
+        "german": "de",
+        "french": "fr",
+        "russian": "ru",
+        "portuguese": "pt",
+        "spanish": "es",
+        "italian": "it",
+    }.get(language.lower(), language.lower() if len(language) == 2 else "na")
 
 
 def _split_text_for_streaming(text: str, max_chars: int = 240) -> list[str]:
@@ -229,6 +332,51 @@ def _segment_instruction(segment: SynthesisSegment, request: SynthesisRequest) -
     if request.instruction and request.segments:
         instruction = f"{instruction} {request.instruction}"
     return instruction
+
+
+def _audio_array(audio: Any) -> np.ndarray:
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+    return np.asarray(audio)
+
+
+def _generate_audio(
+    runtime: TTSRuntime,
+    text: str,
+    segment: SynthesisSegment,
+    request: SynthesisRequest,
+    *,
+    non_streaming_mode: bool,
+) -> tuple[np.ndarray, int]:
+    if runtime.backend is TTSBackend.qwen:
+        wavs, sample_rate = runtime.model.generate_custom_voice(
+            text=text,
+            language=_qwen_language(request.language),
+            speaker=request.speaker,
+            instruct=_segment_instruction(segment, request),
+            non_streaming_mode=non_streaming_mode,
+        )
+        return _audio_array(wavs[0]), int(sample_rate)
+
+    expression_tag, speed = SUPERTONIC_EMOTION_CONTROLS[segment.emotion]
+    expressive_text = f"{expression_tag} {text}".strip() if expression_tag else text
+    voice_name = request.speaker if request.speaker in {f"M{i}" for i in range(1, 6)} | {f"F{i}" for i in range(1, 6)} else SUPERTONIC_VOICE
+    style = runtime.model.get_voice_style(voice_name=voice_name)
+    logger.debug(
+        "supertonic emotion=%s mapped_to=%s expression=%s speed=%.2f voice=%s",
+        segment.emotion.value,
+        _model_emotion(TTSBackend.supertonic, segment.emotion),
+        expression_tag or "none",
+        speed,
+        voice_name,
+    )
+    wav, _ = runtime.model.synthesize(
+        expressive_text,
+        voice_style=style,
+        lang=_supertonic_language(request.language),
+        speed=speed,
+    )
+    return _audio_array(wav), runtime.sample_rate
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -292,7 +440,7 @@ def _autoplay_debug_audio(audio: bytes) -> None:
     logger.info("debug playback started with %s", os.path.basename(player))
 
 
-def _start_debug_pcm_playback() -> subprocess.Popen[bytes] | None:
+def _start_debug_pcm_playback(sample_rate: int) -> subprocess.Popen[bytes] | None:
     """Start ffplay for raw PCM so debug streaming can play each segment immediately."""
     player = shutil.which("ffplay")
     if player is None:
@@ -304,7 +452,7 @@ def _start_debug_pcm_playback() -> subprocess.Popen[bytes] | None:
         "-f",
         "s16le",
         "-ar",
-        str(QWEN_SAMPLE_RATE),
+        str(sample_rate),
         "-i",
         "-",
         "-nodisp",
@@ -326,15 +474,15 @@ def _start_debug_pcm_playback() -> subprocess.Popen[bytes] | None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is mandatory for JeanClawd Voicebox, but no usable NVIDIA GPU was detected."
-        )
-    logger.info("CUDA ready: %s", torch.cuda.get_device_name(0))
+    if DEVICE == "cuda":
+        logger.info("CUDA available: %s; Qwen will be preferred", torch.cuda.get_device_name(0))
+    else:
+        logger.info("CUDA unavailable; Chatterbox CPU fallback will be used for TTS")
     yield
-    global _whisper, _tts
+    global _whisper, _tts, _tts_backend
     _whisper = None
     _tts = None
+    _tts_backend = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -342,7 +490,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="JeanClawd Voicebox",
     version="0.1.0",
-    description="Local Whisper STT and expressive Qwen3-TTS",
+    description="Local Whisper STT with automatic Qwen or Chatterbox TTS",
     lifespan=lifespan,
 )
 
@@ -416,7 +564,7 @@ async def synthesize(request: SynthesisRequest):
         # produce a useful HTTP 500 rather than a broken audio stream.
         from starlette.concurrency import run_in_threadpool
 
-        model = await run_in_threadpool(_get_tts)
+        runtime = await run_in_threadpool(_get_tts)
     except Exception as exc:
         logger.exception("[%s] synthesis failed", request_id)
         raise HTTPException(
@@ -428,19 +576,16 @@ async def synthesize(request: SynthesisRequest):
     if not request.stream:
         try:
             pcm_parts: list[bytes] = []
-            sample_rate = QWEN_SAMPLE_RATE
+            sample_rate = runtime.sample_rate
             with _inference_lock, torch.inference_mode():
                 for segment in segments:
-                    wavs, sample_rate = model.generate_custom_voice(
-                        text=segment.text,
-                        language=_qwen_language(request.language),
-                        speaker=request.speaker,
-                        instruct=_segment_instruction(segment, request),
+                    audio, sample_rate = _generate_audio(
+                        runtime,
+                        segment.text,
+                        segment,
+                        request,
                         non_streaming_mode=True,
                     )
-                    audio = wavs[0]
-                    if isinstance(audio, torch.Tensor):
-                        audio = audio.detach().cpu().numpy()
                     pcm_parts.append(_pcm16(audio))
             wav = _wav_bytes(b"".join(pcm_parts), int(sample_rate))
             _autoplay_debug_audio(wav)
@@ -462,25 +607,22 @@ async def synthesize(request: SynthesisRequest):
             ) from exc
 
     def pcm_stream():
-        sample_rate = QWEN_SAMPLE_RATE
+        sample_rate = runtime.sample_rate
         debug_player = None
         try:
             with _inference_lock:
                 stream_index = 0
                 for segment in segments:
-                    instruction = _segment_instruction(segment, request)
                     for text_chunk in _split_text_for_streaming(segment.text):
                         with torch.inference_mode():
-                            wavs, sample_rate = model.generate_custom_voice(
-                                text=text_chunk,
-                                language=_qwen_language(request.language),
-                                speaker=request.speaker,
-                                instruct=instruction,
-                                # This selects Qwen's lower-latency text path. The
-                                # package still returns one waveform per segment.
+                            audio, sample_rate = _generate_audio(
+                                runtime,
+                                text_chunk,
+                                segment,
+                                request,
                                 non_streaming_mode=False,
                             )
-                        pcm = _pcm16(wavs[0])
+                        pcm = _pcm16(audio)
                         stream_index += 1
                         logger.info(
                             "[%s] streamed segment=%d emotion=%s characters=%d",
@@ -490,7 +632,7 @@ async def synthesize(request: SynthesisRequest):
                             len(text_chunk),
                         )
                         if _debug_play_audio and debug_player is None:
-                            debug_player = _start_debug_pcm_playback()
+                            debug_player = _start_debug_pcm_playback(sample_rate)
                         if debug_player is not None and debug_player.stdin is not None:
                             try:
                                 debug_player.stdin.write(pcm)
@@ -513,10 +655,10 @@ async def synthesize(request: SynthesisRequest):
 
     return StreamingResponse(
         pcm_stream(),
-        media_type=f"audio/L16;rate={QWEN_SAMPLE_RATE};channels=1",
+        media_type=f"audio/L16;rate={runtime.sample_rate};channels=1",
         headers={
             "X-Request-ID": request_id,
-            "X-Audio-Sample-Rate": str(QWEN_SAMPLE_RATE),
+            "X-Audio-Sample-Rate": str(runtime.sample_rate),
             "X-Audio-Format": "s16le",
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
