@@ -6,13 +6,15 @@ import io
 import argparse
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from collections import deque
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,10 +23,19 @@ from typing import Annotated, Any
 
 import soundfile as sf
 import numpy as np
+import psutil
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from rich.align import Align
+from rich.console import Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+from rich.text import Text
 
 logger = logging.getLogger("jeanclawd_voicebox")
 
@@ -55,20 +66,194 @@ def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a conventional boolean environment variable."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEVICE = _device()
 WHISPER_MODEL = os.getenv("VOICEBOX_WHISPER_MODEL", "large-v3")
 TTS_MODEL = os.getenv(
     "VOICEBOX_TTS_MODEL",
     "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 )
+MLX_TTS_MODEL = os.getenv(
+    "VOICEBOX_MLX_TTS_MODEL",
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+)
 QWEN_SAMPLE_RATE = 24_000
 SUPERTONIC_VOICE = os.getenv("VOICEBOX_SUPERTONIC_VOICE", "M1")
+FORCE_QWEN = _env_flag("VOICEBOX_FORCE_QWEN")
 _whisper = None
 _tts = None
 _tts_backend = None
 _model_lock = Lock()
 _inference_lock = Lock()
 _debug_play_audio = False
+_dashboard: "VoiceboxDashboard | None" = None
+
+
+class DashboardLogHandler(logging.Handler):
+    """Route application and Uvicorn logs into the Rich live display."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if _dashboard is not None:
+            _dashboard.add_log(self.format(record), record.levelno)
+
+
+class VoiceboxDashboard:
+    """TTY-only server dashboard with inference state and local resource data."""
+
+    def __init__(self) -> None:
+        self.logs: deque[tuple[str, int]] = deque(maxlen=18)
+        self.model_name = "Not loaded"
+        self.backend = "Waiting"
+        self.activity = "Idle — waiting for a request"
+        self._progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[progress.description]{task.description}"),
+            transient=False,
+        )
+        self._task_id = self._progress.add_task("[dim]Idle", total=None)
+        self._live = Live(self._render(), refresh_per_second=4, screen=False)
+
+    def __enter__(self) -> "VoiceboxDashboard":
+        self._live.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._live.stop()
+
+    def add_log(self, message: str, level: int = logging.INFO) -> None:
+        self.logs.append((message, level))
+        self._refresh()
+
+    def set_model(self, runtime: "TTSRuntime") -> None:
+        self.backend = runtime.backend.value.replace("_", " ").upper()
+        self.model_name = (
+            MLX_TTS_MODEL if runtime.backend is TTSBackend.mlx_qwen else
+            TTS_MODEL if runtime.backend is TTSBackend.qwen else
+            f"Supertonic-3 ({SUPERTONIC_VOICE})"
+        )
+        self._refresh()
+
+    @contextmanager
+    def inference(self, label: str):
+        self.activity = label
+        self._progress.update(self._task_id, description=f"[bold cyan]{label}")
+        self._refresh()
+        try:
+            yield
+        finally:
+            self.activity = "Idle — waiting for a request"
+            self._progress.update(self._task_id, description="[dim]Idle")
+            self._refresh()
+
+    def _refresh(self) -> None:
+        if self._live.is_started:
+            self._live.update(self._render(), refresh=True)
+
+    @staticmethod
+    def _memory_text(bytes_value: int) -> str:
+        return f"{bytes_value / 1024**3:.1f} GiB"
+
+    def _gpu_rows(self) -> list[tuple[str, str]]:
+        if torch.cuda.is_available():
+            index = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(index).total_memory
+            allocated = torch.cuda.memory_allocated(index)
+            utilization = "unavailable"
+            try:
+                utilization = f"{torch.cuda.utilization(index)}%"
+            except (AttributeError, RuntimeError):
+                pass
+            return [
+                ("GPU", torch.cuda.get_device_name(index)),
+                ("GPU load", utilization),
+                ("VRAM", f"{self._memory_text(total - allocated)} free / {self._memory_text(total)}"),
+            ]
+        if _is_apple_silicon():
+            try:
+                import mlx.core as mx
+
+                active = mx.get_active_memory()
+                cache = mx.get_cache_memory()
+                return [
+                    ("GPU", "Apple Metal / MLX"),
+                    ("GPU load", "MPS utilisation unavailable"),
+                    ("MLX memory", f"{self._memory_text(active)} active / {self._memory_text(cache)} cache"),
+                ]
+            except Exception:
+                return [("GPU", "Apple Metal / MLX"), ("GPU load", "not yet initialised")]
+        return [("GPU", "No GPU backend")]
+
+    def _render(self) -> Layout:
+        memory = psutil.virtual_memory()
+        metrics = Table.grid(padding=(0, 1))
+        metrics.add_column(style="bold cyan", no_wrap=True)
+        metrics.add_column(style="white")
+        metrics.add_row("Backend", self.backend)
+        metrics.add_row("Model", self.model_name)
+        metrics.add_row("CPU", f"{psutil.cpu_percent(interval=None):.0f}%")
+        metrics.add_row("Memory", f"{self._memory_text(memory.available)} free / {self._memory_text(memory.total)}")
+        for name, value in self._gpu_rows():
+            metrics.add_row(name, value)
+
+        log_lines: list[Text] = []
+        styles = {
+            logging.ERROR: "bold red",
+            logging.WARNING: "yellow",
+            logging.INFO: "white",
+        }
+        for line, level in self.logs:
+            line_text = line[-220:]
+            # Successful inference completion is the primary timing signal in
+            # the dashboard, so make it immediately scannable without making
+            # ordinary request logs look like successes.
+            style = (
+                "bold green"
+                if re.search(r"\bgenerated in \d+(?:\.\d+)? seconds\b", line_text)
+                else styles.get(level, "dim")
+            )
+            log_lines.append(Text(line_text, style=style))
+        if not log_lines:
+            log_lines.append(Text("Waiting for server logs…", style="dim"))
+
+        left = Panel(
+            Group(self._progress, Text(""), *log_lines),
+            title="[bold cyan]Voicebox activity & live logs",
+            border_style="cyan",
+        )
+        right = Panel(metrics, title="[bold magenta]System monitor", border_style="magenta")
+        layout = Layout()
+        layout.split_row(Layout(left, ratio=3), Layout(right, ratio=2))
+        return layout
+
+
+def _dashboard_activity(label: str):
+    """Use a no-op context outside interactive dashboard mode."""
+    return _dashboard.inference(label) if _dashboard is not None else nullcontext()
+
+
+def _enable_dashboard_logging() -> None:
+    """Keep persistent logs on disk while sending terminal logs to Rich."""
+    # Uvicorn sends normal lifecycle INFO messages through a logger named
+    # ``uvicorn.error``. Showing that implementation name makes successful
+    # startup look like a failure, so the dashboard presents only severity.
+    formatter = logging.Formatter("%(levelname)s: %(message)s")
+    for name in ("jeanclawd_voicebox", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        target = logging.getLogger(name)
+        for handler in list(target.handlers):
+            if type(handler) is logging.StreamHandler:
+                target.removeHandler(handler)
+        handler = DashboardLogHandler()
+        handler.setFormatter(formatter)
+        target.addHandler(handler)
+        target.setLevel(logging.INFO)
+        target.propagate = False
 
 
 class Emotion(str, Enum):
@@ -78,6 +263,18 @@ class Emotion(str, Enum):
     angry = "angry"
     excited = "excited"
     calm = "calm"
+
+
+class Persona(str, Enum):
+    overclocked_ai = "overclocked_ai"
+
+
+PERSONA_INSTRUCTIONS: dict[Persona, str] = {
+    Persona.overclocked_ai: (
+        "Use brisk, delighted, theatrical confidence with slightly over-the-top futuristic AI energy. "
+        "Keep the words friendly, playful, and non-threatening."
+    ),
+}
 
 
 def _get_whisper():
@@ -91,17 +288,19 @@ def _get_whisper():
                     "VOICEBOX_WHISPER_COMPUTE_TYPE",
                     "float16" if DEVICE == "cuda" else "int8",
                 )
-                _whisper = WhisperModel(
-                    WHISPER_MODEL,
-                    device=DEVICE,
-                    compute_type=compute_type,
-                    cpu_threads=int(os.getenv("VOICEBOX_CPU_THREADS", "4")),
-                )
+                with _dashboard_activity(f"Loading Whisper — {WHISPER_MODEL}"):
+                    _whisper = WhisperModel(
+                        WHISPER_MODEL,
+                        device=DEVICE,
+                        compute_type=compute_type,
+                        cpu_threads=int(os.getenv("VOICEBOX_CPU_THREADS", "4")),
+                    )
     return _whisper
 
 
 class TTSBackend(str, Enum):
     qwen = "qwen"
+    mlx_qwen = "mlx_qwen"
     supertonic = "supertonic"
 
 
@@ -119,6 +318,14 @@ class TTSRuntime:
 # available expression profile used by the adapter.
 MODEL_EMOTION_MAP: dict[TTSBackend, dict[Emotion, str]] = {
     TTSBackend.qwen: {
+        Emotion.neutral: "neutral",
+        Emotion.happy: "happy",
+        Emotion.sad: "sad",
+        Emotion.angry: "angry",
+        Emotion.excited: "excited",
+        Emotion.calm: "calm",
+    },
+    TTSBackend.mlx_qwen: {
         Emotion.neutral: "neutral",
         Emotion.happy: "happy",
         Emotion.sad: "sad",
@@ -152,24 +359,55 @@ SUPERTONIC_EMOTION_CONTROLS: dict[Emotion, tuple[str, float]] = {
 }
 
 
+def _is_apple_silicon() -> bool:
+    """MLX uses Metal on native Apple Silicon builds."""
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def _load_mlx_qwen() -> TTSRuntime:
+    """Load the configured MLX Qwen3-TTS model from the Hub or a local path."""
+    from mlx_audio.tts.utils import load
+
+    with _dashboard_activity("Loading MLX Qwen model"):
+        model = load(MLX_TTS_MODEL)
+    logger.info("TTS backend selected: MLX Qwen model=%s", MLX_TTS_MODEL)
+    return TTSRuntime(TTSBackend.mlx_qwen, model, QWEN_SAMPLE_RATE)
+
+
+def _tts_inference_context(runtime: TTSRuntime):
+    """Apply PyTorch inference mode only to the PyTorch Qwen backend."""
+    if runtime.backend is TTSBackend.qwen:
+        return torch.inference_mode()
+    return nullcontext()
+
+
 def _get_tts() -> TTSRuntime:
     global _tts, _tts_backend
     if _tts is None:
         with _model_lock:
             if _tts is None:
-                if DEVICE == "cuda":
+                if _is_apple_silicon():
                     try:
-                        from qwen_tts import Qwen3TTSModel
-
-                        _tts = Qwen3TTSModel.from_pretrained(
-                            TTS_MODEL,
-                            device_map="cuda:0",
-                            dtype=torch.bfloat16,
-                        )
-                        _tts_backend = TTSRuntime(TTSBackend.qwen, _tts, QWEN_SAMPLE_RATE)
-                        logger.info("TTS backend selected: qwen device=cuda")
+                        _tts_backend = _load_mlx_qwen()
+                        _tts = _tts_backend.model
                     except Exception:
-                        logger.exception("Qwen could not be loaded; falling back to Chatterbox")
+                        logger.exception("MLX Qwen could not be loaded; trying the next TTS backend")
+
+                if (DEVICE == "cuda" or FORCE_QWEN) and not _is_apple_silicon():
+                    if _tts_backend is None:
+                        try:
+                            from qwen_tts import Qwen3TTSModel
+
+                            with _dashboard_activity("Loading PyTorch Qwen model"):
+                                _tts = Qwen3TTSModel.from_pretrained(
+                                    TTS_MODEL,
+                                    device_map="cuda:0" if DEVICE == "cuda" else DEVICE,
+                                    dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
+                                )
+                            _tts_backend = TTSRuntime(TTSBackend.qwen, _tts, QWEN_SAMPLE_RATE)
+                            logger.info("TTS backend selected: qwen device=%s", DEVICE)
+                        except Exception:
+                            logger.exception("Qwen could not be loaded; falling back to Supertonic")
 
                 if _tts_backend is None:
                     try:
@@ -180,7 +418,8 @@ def _get_tts() -> TTSRuntime:
                             "Install the supertonic package in the runtime environment used by Voicebox."
                         ) from exc
 
-                    _tts = TTS(auto_download=True)
+                    with _dashboard_activity("Loading Supertonic model"):
+                        _tts = TTS(auto_download=True)
                     _tts_backend = TTSRuntime(
                         TTSBackend.supertonic,
                         _tts,
@@ -189,6 +428,8 @@ def _get_tts() -> TTSRuntime:
                     logger.info("TTS backend selected: supertonic")
     if _tts_backend is None:
         raise RuntimeError("No TTS backend is available")
+    if _dashboard is not None:
+        _dashboard.set_model(_tts_backend)
     return _tts_backend
 
 
@@ -216,6 +457,7 @@ class SynthesisRequest(BaseModel):
     text: str | None = Field(default=None, max_length=10_000)
     emotion: Emotion = Emotion.neutral
     speaker: str = Field(default="Ryan", min_length=1, max_length=64)
+    persona: Persona | None = None
     instruction: str | None = Field(default=None, max_length=500)
     language: str = Field(default="English", min_length=2, max_length=32)
     stream: bool = Field(default=True, description="Stream signed 16-bit PCM segments")
@@ -326,12 +568,14 @@ def _synthesis_segments(request: SynthesisRequest) -> list[SynthesisSegment]:
 
 
 def _segment_instruction(segment: SynthesisSegment, request: SynthesisRequest) -> str:
-    instruction = _emotion_instruction(segment.emotion)
+    instructions = [_emotion_instruction(segment.emotion)]
     if segment.instruction:
-        instruction = f"{instruction} {segment.instruction}"
+        instructions.append(segment.instruction)
     if request.instruction and request.segments:
-        instruction = f"{instruction} {request.instruction}"
-    return instruction
+        instructions.append(request.instruction)
+    if request.persona:
+        instructions.append(PERSONA_INSTRUCTIONS[request.persona])
+    return " ".join(instructions)
 
 
 def _audio_array(audio: Any) -> np.ndarray:
@@ -348,6 +592,16 @@ def _generate_audio(
     *,
     non_streaming_mode: bool,
 ) -> tuple[np.ndarray, int]:
+    if runtime.backend is TTSBackend.mlx_qwen:
+        results = runtime.model.generate_custom_voice(
+            text=text,
+            language=request.language,
+            speaker=request.speaker,
+            instruct=_segment_instruction(segment, request),
+        )
+        result = next(iter(results))
+        return _audio_array(result.audio), int(getattr(result, "sample_rate", runtime.sample_rate))
+
     if runtime.backend is TTSBackend.qwen:
         wavs, sample_rate = runtime.model.generate_custom_voice(
             text=text,
@@ -476,8 +730,14 @@ def _start_debug_pcm_playback(sample_rate: int) -> subprocess.Popen[bytes] | Non
 async def lifespan(_: FastAPI):
     if DEVICE == "cuda":
         logger.info("CUDA available: %s; Qwen will be preferred", torch.cuda.get_device_name(0))
+    elif _is_apple_silicon():
+        logger.info("Apple Silicon detected; MLX Qwen will be preferred")
+        if FORCE_QWEN:
+            logger.warning("--force-qwen is ignored on Apple Silicon; MLX Qwen is already preferred")
+    elif FORCE_QWEN:
+        logger.info("CUDA unavailable; Qwen is forced on CPU")
     else:
-        logger.info("CUDA unavailable; Chatterbox CPU fallback will be used for TTS")
+        logger.info("CUDA unavailable; Supertonic CPU fallback will be used for TTS")
     yield
     global _whisper, _tts, _tts_backend
     _whisper = None
@@ -490,7 +750,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="JeanClawd Voicebox",
     version="0.1.0",
-    description="Local Whisper STT with automatic Qwen or Chatterbox TTS",
+    description="Local Whisper STT with automatic MLX/PyTorch Qwen or Supertonic TTS",
     lifespan=lifespan,
 )
 
@@ -517,12 +777,13 @@ async def transcribe(
             source.write(data)
             source.flush()
             with _inference_lock:
-                segments, info = _get_whisper().transcribe(
-                    source.name,
-                    beam_size=int(os.getenv("VOICEBOX_BEAM_SIZE", "5")),
-                    vad_filter=True,
-                    condition_on_previous_text=True,
-                )
+                with _dashboard_activity(f"Transcribing — {audio.filename or 'audio'}"):
+                    segments, info = _get_whisper().transcribe(
+                        source.name,
+                        beam_size=int(os.getenv("VOICEBOX_BEAM_SIZE", "5")),
+                        vad_filter=True,
+                        condition_on_previous_text=True,
+                    )
                 segment_list = list(segments)
         text = " ".join(segment.text.strip() for segment in segment_list).strip()
         logger.info("[%s] started -> transcribed in %.1f seconds", request_id, time.perf_counter() - started)
@@ -577,15 +838,18 @@ async def synthesize(request: SynthesisRequest):
         try:
             pcm_parts: list[bytes] = []
             sample_rate = runtime.sample_rate
-            with _inference_lock, torch.inference_mode():
+            with _inference_lock, _tts_inference_context(runtime):
                 for segment in segments:
-                    audio, sample_rate = _generate_audio(
-                        runtime,
-                        segment.text,
-                        segment,
-                        request,
-                        non_streaming_mode=True,
-                    )
+                    with _dashboard_activity(
+                        f"Synthesizing {len(segment.text)} characters — {runtime.backend.value}"
+                    ):
+                        audio, sample_rate = _generate_audio(
+                            runtime,
+                            segment.text,
+                            segment,
+                            request,
+                            non_streaming_mode=True,
+                        )
                     pcm_parts.append(_pcm16(audio))
             wav = _wav_bytes(b"".join(pcm_parts), int(sample_rate))
             _autoplay_debug_audio(wav)
@@ -614,14 +878,17 @@ async def synthesize(request: SynthesisRequest):
                 stream_index = 0
                 for segment in segments:
                     for text_chunk in _split_text_for_streaming(segment.text):
-                        with torch.inference_mode():
-                            audio, sample_rate = _generate_audio(
-                                runtime,
-                                text_chunk,
-                                segment,
-                                request,
-                                non_streaming_mode=False,
-                            )
+                        with _tts_inference_context(runtime):
+                            with _dashboard_activity(
+                                f"Synthesizing stream segment {stream_index + 1} — {runtime.backend.value}"
+                            ):
+                                audio, sample_rate = _generate_audio(
+                                    runtime,
+                                    text_chunk,
+                                    segment,
+                                    request,
+                                    non_streaming_mode=False,
+                                )
                         pcm = _pcm16(audio)
                         stream_index += 1
                         logger.info(
@@ -675,16 +942,34 @@ def main() -> None:
         action="store_true",
         help="temporarily autoplay generated TTS audio using a local audio player",
     )
-    args = parser.parse_args()
-    global _debug_play_audio
-    _debug_play_audio = args.debug
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    uvicorn.run(
-        "jeanclawd_voicebox.server:app",
-        host=os.getenv("VOICEBOX_HOST", "0.0.0.0"),
-        port=int(os.getenv("VOICEBOX_PORT", "8000")),
-        reload=False,
+    parser.add_argument(
+        "--force-qwen",
+        action="store_true",
+        help="force the PyTorch Qwen CPU backend when CUDA is unavailable (non-Apple hosts only)",
     )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="show a Rich live dashboard with inference stages, logs, and system telemetry",
+    )
+    args = parser.parse_args()
+    global _debug_play_audio, FORCE_QWEN, _dashboard
+    _debug_play_audio = args.debug
+    FORCE_QWEN = FORCE_QWEN or args.force_qwen
+    run_options = {
+        "host": os.getenv("VOICEBOX_HOST", "0.0.0.0"),
+        "port": int(os.getenv("VOICEBOX_PORT", "8000")),
+        "reload": False,
+    }
+    if args.dashboard:
+        _dashboard = VoiceboxDashboard()
+        _enable_dashboard_logging()
+        with _dashboard:
+            uvicorn.run("jeanclawd_voicebox.server:app", log_config=None, **run_options)
+        _dashboard = None
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+        uvicorn.run("jeanclawd_voicebox.server:app", **run_options)
 
 
 if __name__ == "__main__":

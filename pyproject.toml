@@ -1,18 +1,23 @@
 [project]
 name = "jeanclawd-voicebox"
 version = "0.1.0"
-description = "FastAPI Whisper STT with automatic Qwen or Supertonic TTS"
+description = "FastAPI Whisper STT with automatic MLX/PyTorch Qwen or Supertonic TTS"
 readme = "README.md"
 authors = [
     { name = "Gokhan Demirtas", email = "gokhan@ftuff.org" }
 ]
 requires-python = ">=3.10,<3.14"
 dependencies = [
+    "av>=11,<19", # PyAV 19 removed av.open(metadata_errors=...), used by faster-whisper 1.2.x.
     "fastapi>=0.115.0",
     "faster-whisper>=1.1.0",
+    "mlx-audio>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
     "python-multipart>=0.0.9",
-    "qwen-tts>=0.1.1",
+    "qwen-tts>=0.1.1; sys_platform != 'darwin'",
+    "qwen-tts>=0.1.1; sys_platform == 'darwin' and platform_machine != 'arm64'",
+    "psutil>=5.9.0",
+    "rich>=13.9.0",
     "soundfile>=0.12.1",
     "supertonic>=1.3.1",
     "torch>=2.6.0",
