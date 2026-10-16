@@ -267,13 +267,63 @@ class Emotion(str, Enum):
 
 class Persona(str, Enum):
     overclocked_ai = "overclocked_ai"
+    jean = "jean"
+    jerk = "jerk"
+    beth = "beth"
+    kimi = "kimi"
+    borg = "borg"
+    fred = "fred"
+    ztyntchtch = "ztyntchtch"
+    morrow = "morrow"
+    riff = "riff"
+    mr_meowsky = "mr_meowsky"
 
 
 PERSONA_INSTRUCTIONS: dict[Persona, str] = {
     Persona.overclocked_ai: (
         "Use brisk, delighted, theatrical confidence with slightly over-the-top futuristic AI energy. "
-        "Keep the words friendly, playful, and non-threatening."
+        "Keep the words friendly, playful, sometimes uncanny, but non-threatening."
     ),
+    Persona.jean: (
+          "Speak with warm, calm confidence. Friendly and clear, with a measured cadence "
+          "that feels reassuring without being over-eager."
+      ),
+      Persona.jerk: (
+          "Deliver lines with barely-concealed impatience: crisp diction, slightly clipped pacing, "
+          "a dry sardonic edge at the end of sentences — as if helping is beneath you."
+      ),
+      Persona.beth: (
+          "Speak in a low, slow, subdued tone. Slightly monotone with a quiet, resigned quality. "
+          "Never loud or bright; every sentence carries the weight of quiet exhaustion."
+      ),
+      Persona.kimi: (
+          "Speak with bright, bouncy energy. Upward inflections, fast rhythm, warm and light — "
+          "like someone genuinely delighted by absolutely everything they are saying."
+      ),
+      Persona.borg: (
+          "Speak in a flat, even monotone. Uniform pacing, no emotional inflection whatsoever. "
+          "Clinical and precise; every word chosen for maximum information density."
+      ),
+      Persona.fred: (
+          "Speak in a low, urgent, conspiratorial tone — slightly hushed but intense, "
+          "as if sharing classified information. Pace quickens on the dire parts."
+      ),
+      Persona.ztyntchtch: (
+          "Speak with rapid, unsettling alien cadence: unexpected micro-pauses, occasional drawn-out syllables, "
+          "and faint wonder at the strangeness of everything being described."
+      ),
+      Persona.morrow: (
+          "Speak calmly and deliberately. Measured pace with thoughtful pauses between ideas — "
+          "the tone of a patient mentor who has seen this problem before and knows the way through."
+      ),
+      Persona.riff: (
+          "Speak with theatrical energy and rock musician flair. Dynamic range, punchy emphasis on key words, "
+          "playful rhythm — like a guitarist mid-riff who also happens to know the answer."
+      ),
+      Persona.mr_meowsky: (
+          "Speak with sleepy indifference punctuated by sudden alert interest. Languid pace thatoccasionally "
+          "sharpens without warning, as if something moving just caught your eye."
+      ),
 }
 
 
@@ -456,7 +506,7 @@ class SynthesisSegment(BaseModel):
 class SynthesisRequest(BaseModel):
     text: str | None = Field(default=None, max_length=10_000)
     emotion: Emotion = Emotion.neutral
-    speaker: str = Field(default="Ryan", min_length=1, max_length=64)
+    speaker: str = Field(default="vivian", min_length=1, max_length=64)
     persona: Persona | None = None
     instruction: str | None = Field(default=None, max_length=500)
     language: str = Field(default="English", min_length=2, max_length=32)
@@ -520,6 +570,13 @@ def _qwen_language(language: str) -> str:
         "it": "Italian",
     }
     return names.get(language.lower(), language)
+
+
+def _generation_language(request: SynthesisRequest) -> str:
+    """Apply persona-specific language choices before calling a TTS backend."""
+    if request.persona is Persona.ztyntchtch:
+        return "Japanese"
+    return request.language
 
 
 def _supertonic_language(language: str) -> str:
@@ -592,10 +649,11 @@ def _generate_audio(
     *,
     non_streaming_mode: bool,
 ) -> tuple[np.ndarray, int]:
+    language = _generation_language(request)
     if runtime.backend is TTSBackend.mlx_qwen:
         results = runtime.model.generate_custom_voice(
             text=text,
-            language=request.language,
+            language=language,
             speaker=request.speaker,
             instruct=_segment_instruction(segment, request),
         )
@@ -605,7 +663,7 @@ def _generate_audio(
     if runtime.backend is TTSBackend.qwen:
         wavs, sample_rate = runtime.model.generate_custom_voice(
             text=text,
-            language=_qwen_language(request.language),
+            language=_qwen_language(language),
             speaker=request.speaker,
             instruct=_segment_instruction(segment, request),
             non_streaming_mode=non_streaming_mode,
@@ -627,7 +685,7 @@ def _generate_audio(
     wav, _ = runtime.model.synthesize(
         expressive_text,
         voice_style=style,
-        lang=_supertonic_language(request.language),
+        lang=_supertonic_language(language),
         speed=speed,
     )
     return _audio_array(wav), runtime.sample_rate
@@ -813,6 +871,11 @@ async def synthesize(request: SynthesisRequest):
     started = time.perf_counter()
     segments = _synthesis_segments(request)
     character_count = sum(len(segment.text) for segment in segments)
+    print(
+        f"\033[96m[{request_id}] synthesize parameters:\033[0m "
+        f"\033[92m{request.model_dump_json()}\033[0m",
+        flush=True,
+    )
     logger.info(
         "[%s] request received, processing synthesis: emotion=%s characters=%d",
         request_id,
